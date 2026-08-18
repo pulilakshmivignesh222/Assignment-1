@@ -1,3 +1,5 @@
+fastapi
+uvicorn[standard]
 langchain
 langchain-core
 langchain-google-genai
