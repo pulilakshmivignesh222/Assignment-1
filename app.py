@@ -1,340 +1,401 @@
-import os
-import json
-import requests
-import uvicorn
 
-from fastapi import FastAPI
-from pydantic import BaseModel, Field
 
-from langserve import add_routes
+import sys
+
+import io
+
+import traceback
+
+from typing import TypedDict, List, Optional
+
+from langchain_core.messages import BaseMessage, HumanMessage
+
 from langchain_core.tools import tool
-from langchain_core.runnables import RunnableLambda
+
+from langgraph.graph import StateGraph, START, END
+
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.agents import create_agent
 
 
-# =========================================================
-# 1. TOOLS
-# =========================================================
+
+# ==========================================
+
+# 1. LLM INITIALIZATION
+
+# ==========================================
+
+# Initialize your LLM here (e.g., ChatOpenAI, ChatGoogleGenerativeAI, etc.)
+
+
+
+import google.generativeai as genai
+
+from google.colab import userdata
+
+
+
+# Retrieve the API key from secrets
+
+try:
+
+  api_key = userdata.get('GEMINI_API_KEY')
+
+  genai.configure(api_key=api_key)
+
+  print("API Key configured successfully.")
+
+except userdata.SecretNotFoundError:
+
+  print("Error: GEMINI_API_KEY not found in secrets")
+
+
+
+llm_flash = ChatGoogleGenerativeAI(model="gemini-3.1-flash-lite-preview", google_api_key = api_key)
+
+llm= llm_flash
+
+
+
+# ==========================================
+
+# 2. STATE DEFINITION
+
+# ==========================================
+
+class CrewState(TypedDict):
+
+  messages: List[BaseMessage]
+
+  next_step: Optional[str]
+
+  code: Optional[str]
+
+  report: Optional[str]
+
+
+
+# ==========================================
+
+# 3. TOOLS
+
+# ==========================================
 
 @tool
-def search_movies(genre: str) -> str:
-    """Search for Indian movies by genre."""
 
-    movies = {
-        "sci-fi": "Cargo, 2.0, Mr. India",
-        "comedy": "3 Idiots, Hera Pheri, Munna Bhai M.B.B.S.",
-        "action": "RRR, Vikram, Baahubali"
-    }
+def run_python_code(code: str) -> str:
 
-    return movies.get(
-        genre.lower(),
-        "No movies found for that genre"
-    )
+  """Execute python code and return the standard output or error trace."""
+
+  if not isinstance(code, str):
+
+    code = str(code)
+
+  clean_code = code.replace('```python', '').replace('```', '').strip()
+
+
+
+  old_stdout = sys.stdout
+
+  new_stdout = io.StringIO()
+
+  sys.stdout = new_stdout
+
+
+
+  try:
+
+    local_scope = {}
+
+    exec(clean_code, {}, local_scope)
+
+    result = new_stdout.getvalue()
+
+  except Exception as e:
+
+    result = f"Execution Error:\n{traceback.format_exc()}"
+
+  finally:
+
+    sys.stdout = old_stdout
+
+
+
+  return result.strip() if result.strip() else "Success (no terminal output)"
+
+
+
 
 
 @tool
-def change__to_f(temp_c: float) -> float:
-    """Convert Celsius temperature to Fahrenheit."""
 
-    return temp_c * 1.8 + 32
+def generate_test_cases(task_description: str) -> str:
 
+   """Generate specific test scenarios for a given coding task."""
 
-@tool
-def get_weather(city: str) -> str:
-    """Get current temperature for a given city name."""
+   prompt = (
 
-    # Geocoding API
-    geo_url = "https://geocoding-api.open-meteo.com/v1/search"
+     f"You are a Senior QA Engineer. Generate 3 to 5 highly specific test scenarios "
 
-    geo_params = {
-        "name": city,
-        "count": 1
-    }
+     f"for the following coding task: '{task_description}'.\n"
 
-    geo_response = requests.get(
-        geo_url,
-        params=geo_params,
-        timeout=15
-    ).json()
+     f"Include standard cases and edge cases. Return them as a numbered list."
 
-    if "results" not in geo_response:
-        return f"Could not find weather data for city: {city}"
+   )
 
-    location = geo_response["results"][0]
+   response = llm.invoke(prompt)
 
-    latitude = location["latitude"]
-    longitude = location["longitude"]
+   return response.content if hasattr(response, 'content') else str(response)
 
-    # Weather API
-    weather_url = "https://api.open-meteo.com/v1/forecast"
 
-    weather_params = {
-        "latitude": latitude,
-        "longitude": longitude,
-        "current": "temperature_2m,weather_code",
-        "temperature_unit": "celsius"
-    }
 
-    weather_response = requests.get(
-        weather_url,
-        params=weather_params,
-        timeout=15
-    ).json()
+# Initialize the test tool with the LLM
 
-    current = weather_response["current"]
+# (Uncomment this once your LLM is initialized above)
 
-    result = {
-        "resolved_city": location["name"],
-        "temperature_celsius": current["temperature_2m"],
-        "weather_code": current["weather_code"]
-    }
+# generate_test_cases = create_test_generator_tool(llm_flash)
 
-    return json.dumps(result)
 
 
-# List of tools
-tools = [
-    get_weather,
-    search_movies,
-    change__to_f
-]
+# ==========================================
 
+# 4. GRAPH NODES
 
-# =========================================================
-# 2. GEMINI API KEY
-# =========================================================
+# ==========================================
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+def task_input_node(state: CrewState):
 
-if not GEMINI_API_KEY:
-    raise ValueError(
-        "GEMINI_API_KEY environment variable is not set."
-    )
+  print("\n" + "="*50)
 
+  print("--- NEW TASK INITIALIZATION ---")
 
-# =========================================================
-# 3. INITIALIZE MODEL
-# =========================================================
+  user_task = input("Enter the coding task (or type 'exit' to quit): ").strip()
 
-llm_flash = ChatGoogleGenerativeAI(
-    model="gemma-4-31b-it",
-    api_key=GEMINI_API_KEY,
-    temperature=0
-)
 
 
-# =========================================================
-# 4. CREATE AGENT
-# =========================================================
+  if user_task.lower() == 'exit':
 
-agent = create_agent(
-    model=llm_flash,
-    tools=tools,
-    system_prompt=(
-        "You are a specialized agent restricted ONLY to "
-        "Indian weather and Indian cinema. "
+     return {"next_step": "exit"}
 
-        "You can answer questions about weather in Indian cities "
-        "and Indian movies. "
 
-        "For any other topic, question, role, or general knowledge "
-        "outside Indian weather and Indian cinema, you must say exactly: "
 
-        "'I am not authorized to answer questions outside of "
-        "Indian weather and cinema.' "
+  return {
 
-        "Never show internal thinking or reasoning. "
-        "Return only the final answer to the user."
-    )
-)
+    "messages": [HumanMessage(content=user_task)],
 
+    "next_step": "developer"
 
-# =========================================================
-# 5. INPUT MODEL
-# =========================================================
+  }
 
-class AgentInput(BaseModel):
-    input: str = Field(
-        description="Your message to the agent"
-    )
 
 
-# =========================================================
-# 6. FORMAT INPUT
-# =========================================================
+def real_time_developer(state: CrewState):
 
-def format_for_agent(x) -> dict:
+  print("\n[Developer] Writing dynamic code using LLM...")
 
-    if isinstance(x, dict):
-        user_input = x["input"]
-    else:
-        user_input = x.input
+  # Get the latest task description
 
-    return {
-        "messages": [
-            ("user", user_input)
-        ]
-    }
+  task = state['messages'][-1].content
 
+  dev_prompt = f"Write a clean Python script to solve this: {task}. Only return the code, no explanation or markdown formatting."
 
-# =========================================================
-# 7. EXTRACT ONLY FINAL ANSWER
-# =========================================================
 
-def extract_text_response(agent_output) -> str:
 
-    # If output is already a string
-    if isinstance(agent_output, str):
-        return agent_output
+  # Ensure LLM is initialized before calling
 
-    # Make sure output is a dictionary
-    if not isinstance(agent_output, dict):
-        return str(agent_output)
+  if llm_flash is None:
 
-    # Get messages
-    messages = agent_output.get("messages")
+    raise ValueError("LLM is not initialized. Please set up 'llm_flash'.")
 
-    # Check nested dictionaries
-    if messages is None:
 
-        for value in agent_output.values():
 
-            if isinstance(value, dict):
+  response = llm_flash.invoke(dev_prompt)
 
-                if "messages" in value:
-                    messages = value["messages"]
-                    break
+  # --- FIX: Safely parse Gemini's content format ---
 
-    if not messages:
-        return str(agent_output)
+  content = response.content
 
-    # Find the final AI message
-    for message in reversed(messages):
+  if isinstance(content, list):
 
-        content = getattr(
-            message,
-            "content",
-            None
-        )
+    # Extract the text from the first dictionary in the list
 
-        if content is None:
-            continue
+    code_str = content[0].get('text', '') if isinstance(content[0], dict) else str(content[0])
 
-        # Normal string response
-        if isinstance(content, str):
+  else:
 
-            if content.strip():
-                return content.strip()
+    # It's already a standard string
 
-        # Gemini content blocks
-        if isinstance(content, list):
+    code_str = str(content)
 
-            text_parts = []
+  print(code_str)
 
-            for item in content:
+  return {"code": code_str}
 
-                if isinstance(item, dict):
 
-                    # Ignore thinking/reasoning
-                    if item.get("type") == "thinking":
-                        continue
 
-                    # Extract text
-                    if item.get("type") == "text":
+def real_time_tester(state: CrewState):
 
-                        text = item.get("text", "")
+  print("\n[Tester] Generating dynamic tests and executing code...")
 
-                        if text:
-                            text_parts.append(text)
+  task = state['messages'][-1].content
 
-                    elif "text" in item:
 
-                        text = item.get("text", "")
 
-                        if text:
-                            text_parts.append(text)
+  # Generate tests
 
-                elif isinstance(item, str):
+  test_cases = generate_test_cases.invoke(task)
 
-                    text_parts.append(item)
+  content = test_cases
 
-            if text_parts:
-                return "".join(text_parts).strip()
+  if isinstance(content, list):
 
-    return "No final response was generated."
+    # Extract the text from the first dictionary in the list
 
+    cases_str = content[0].get('text', '') if isinstance(content[0], dict) else str(content[0])
 
-# =========================================================
-# 8. CREATE LANGCHAIN CHAIN
-# =========================================================
+  else:
 
-formatted_agent_chain = (
-    RunnableLambda(format_for_agent)
-    | agent
-    | RunnableLambda(extract_text_response)
-).with_types(
-    input_type=AgentInput,
-    output_type=str
-)
+    # It's already a standard string
 
+    cases_str = str(content)
 
-# =========================================================
-# 9. FASTAPI APPLICATION
-# =========================================================
+  # Execute code
 
-app = FastAPI(
-    title="Indian Weather and Cinema Agent",
-    version="1.0.0"
-)
+  execution_result = run_python_code.invoke({"code": state['code']})
 
 
-# =========================================================
-# 10. LANGSERVE ROUTE
-# =========================================================
 
-add_routes(
-    app,
-    formatted_agent_chain,
-    path="/agent",
-    playground_type="default"
-)
+  # Compile Report
 
+  report = f"### EXECUTION OUTPUT:\n{execution_result}\n\n### TEST SCENARIOS EVALUATED:\n{cases_str}"
 
-# =========================================================
-# 11. HEALTH CHECK
-# =========================================================
+  return {"report": report}
 
-@app.get("/")
-def home():
-    return {
-        "status": "running",
-        "message": "Indian Weather and Cinema Agent is running."
-    }
 
 
-@app.get("/health")
-def health():
-    return {
-        "status": "healthy"
-    }
+def manager_decision_node(state: CrewState):
 
+  print("\n" + "="*50)
 
-# =========================================================
-# 12. START SERVER
-# =========================================================
+  print("--- MANAGER DASHBOARD : TEST REPORT ---")
+
+  print(state.get('report', 'No report available.'))
+
+  print("="*50)
+
+
+
+  user_input = input("\nCommand (store / another): ").lower().strip()
+
+
+
+  if user_input == 'store':
+
+    return {"next_step": "archiver"}
+
+  else:
+
+    return {"next_step": "task_input"}
+
+
+
+def archiver_node(state: CrewState):
+
+  print("\n[Archiver] Task stored successfully. Closing workflow.")
+
+  return {"next_step": "exit"}
+
+
+
+# ==========================================
+
+# 5. GRAPH CONSTRUCTION & ROUTING
+
+# ==========================================
+
+rt_workflow = StateGraph(CrewState)
+
+
+
+rt_workflow.add_node("task_input", task_input_node)
+
+rt_workflow.add_node("developer", real_time_developer)
+
+rt_workflow.add_node("tester", real_time_tester)
+
+rt_workflow.add_node("manager_decision", manager_decision_node)
+
+rt_workflow.add_node("archiver", archiver_node)
+
+
+
+rt_workflow.add_edge(START, "task_input")
+
+
+
+def route_from_input(state):
+
+  if state.get('next_step') == "exit":
+
+    return END
+
+  return "developer"
+
+
+
+rt_workflow.add_conditional_edges("task_input", route_from_input)
+
+
+
+# Sequential flow
+
+rt_workflow.add_edge("developer", "tester")
+
+rt_workflow.add_edge("tester", "manager_decision")
+
+
+
+def route_from_decision(state):
+
+  if state.get('next_step') == "archiver":
+
+    return "archiver"
+
+  return "task_input"
+
+
+
+rt_workflow.add_conditional_edges("manager_decision", route_from_decision)
+
+rt_workflow.add_edge("archiver", END)
+
+
+
+rt_app = rt_workflow.compile()
+
+print("Interactive pipeline compiled and ready for live execution.")
+
+
+
+# ==========================================
+
+# 6. EXECUTION LOOP
+
+# ==========================================
 
 if __name__ == "__main__":
 
-    port = int(
-        os.environ.get(
-            "PORT",
-            8000
-        )
-    )
+  try:
 
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=port
-    )
+    # Start the application with an empty state
+
+    # The recursion limit is set high to allow for multiple loops (another task)
+
+    rt_app.invoke({"messages": []}, config={"recursion_limit": 50})
+
+  except KeyboardInterrupt:
+
+    print("\nStopped by user.")
+
+  except Exception as e:
+
+    print(f"\nAn error occurred: {e}")
